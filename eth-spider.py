@@ -2,7 +2,7 @@ from web3 import Web3
 import websockets
 import asyncio
 import json
-import requests
+import aiohttp
 import config
 import abi
 
@@ -48,7 +48,7 @@ def fetch_block_details(block_number):
     """
     return web3.eth.get_block(block_number)
 
-def send_to_telegram(message):
+async def send_to_telegram(message):
     """
     Sends the provided message to a Telegram chat via a bot.
     
@@ -58,21 +58,20 @@ def send_to_telegram(message):
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"  # Enables Markdown formatting
+        "parse_mode": "Markdown"
     }
 
-    try:
-        response = requests.post(config.TELEGRAM_SEND_ENDPOINT, data=payload)
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(config.TELEGRAM_SEND_ENDPOINT, data=payload) as resp:
+                if resp.status != 200:
+                    print(f"Telegram error: Status {resp.status}")
+                else:
+                    print("Message sent to Telegram")
+        except Exception as e:
+            print(f"Error sending to Telegram: {e}")
 
-        if response.status_code != 200:
-            print(f"Failed to send message to Telegram. Status Code: {response.status_code}")
-        else:
-            print("Message sent to Telegram successfully.")
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending message to Telegram: {e}")
-
-def log_transaction(log, contract):
+async def log_transaction(log, contract):
     """
     Processes and logs the details of a transaction from the contract's event log.
 
@@ -80,46 +79,86 @@ def log_transaction(log, contract):
         log (dict): The log object containing the transaction data.
         contract (Web3.eth.Contract): The contract instance for the ERC-20 token.
     """
-    tx_hash = log["transactionHash"]
-    block_number = int(log["blockNumber"], 16)
+    try:
+        tx_hash = log.get("transactionHash")
+        block_number_hex = log.get("blockNumber")
+        if not tx_hash or not block_number_hex:
+            raise ValueError("Missing transactionHash or blockNumber in log.")
 
-    # Decode the 'from' and 'to' addresses
-    from_address = Web3.to_checksum_address(log["topics"][1][26:] if len(log["topics"]) > 1 else "Unknown")
-    to_address = Web3.to_checksum_address(log["topics"][2][26:] if len(log["topics"]) > 2 else "Unknown")
+        try:
+            block_number = int(block_number_hex, 16)
+        except ValueError:
+            raise ValueError(f"Invalid block number format: {block_number_hex}")
 
-    # Decode the value transferred
-    value_in_wei = decode_log_data(log["data"])
+        topics = log.get("topics", [])
+        from_address = "0x0"
+        to_address = "0x0"
 
-    # Fetch additional transaction and block details
-    tx = fetch_transaction_details(tx_hash)
-    block = fetch_block_details(block_number)
+        if len(topics) > 1:
+            try:
+                from_address = Web3.to_checksum_address("0x" + topics[1][-40:])
+            except Exception:
+                pass
 
-    # Convert value to tokens using the contract's decimals
-    decimals = contract.functions.decimals().call()
-    token_value = value_in_wei / (10 ** decimals)
+        if len(topics) > 2:
+            try:
+                to_address = Web3.to_checksum_address("0x" + topics[2][-40:])
+            except Exception:
+                pass
 
-    # Get the token symbol and name
-    token_name = contract.functions.name().call()
-    token_symbol = contract.functions.symbol().call()
+        value_in_wei = 0
+        try:
+            value_in_wei = decode_log_data(log.get("data", "0x0"))
+        except Exception:
+            pass
 
-    # Formatted output
-    message = (
-        f"*🕷️ New {token_name} transaction*\n\n"
-        f"*Token Symbol:* `${token_symbol}`\n\n"
-        f"*Tx Hash:* [{tx_hash}](https://etherscan.io/tx/{tx_hash})\n"
-        f"*Block:* `{block_number}` | *Block Hash:* `{block['hash'].hex()}`\n\n"
-        f"*From:* [{from_address}](https://etherscan.io/address/{from_address})\n"
-        f"*To:* [{to_address}](https://etherscan.io/address/{to_address})\n\n"
-        f"*Amount Transferred:* `{token_value:.6f} {token_symbol}`\n\n"
-        f"*Gas Used:* `{tx['gas']}` | *Gas Price:* `{tx['gasPrice'] / (10**9)} Gwei`\n\n"
-        f"*Timestamp:* `{block['timestamp']}`\n\n"
-        f"[View on Etherscan](https://etherscan.io/tx/{tx_hash})"
+        tx = await asyncio.to_thread(fetch_transaction_details, tx_hash)
+        block = await asyncio.to_thread(fetch_block_details, block_number)
+
+        # Fallback values if calls fail
+        decimals = await asyncio.to_thread(lambda: contract.functions.decimals().call())
+        token_name = await asyncio.to_thread(lambda: contract.functions.name().call())
+        token_symbol = await asyncio.to_thread(lambda: contract.functions.symbol().call())
+
+        token_value = value_in_wei / (10 ** decimals if decimals is not None else 18)
+
+        message = (
+            f"*🕷️ New {token_name or 'ERC20'} transaction*\n\n"
+            f"*Token Symbol:* `${token_symbol or 'UNKNOWN'}`\n\n"
+            f"*Tx Hash:* [{tx_hash}](https://etherscan.io/tx/{tx_hash})\n"
+            f"*Block:* `{block_number}` | *Block Hash:* `{block.get('hash', b'').hex() if block.get('hash') else 'N/A'}`\n\n"
+            f"*From:* [{from_address}](https://etherscan.io/address/{from_address})\n"
+            f"*To:* [{to_address}](https://etherscan.io/address/{to_address})\n\n"
+            f"*Amount Transferred:* `{token_value:.6f} {token_symbol or ''}`\n\n"
+            f"*Gas Used:* `{tx.get('gas', 'N/A')}` | *Gas Price:* `{tx.get('gasPrice', 0) / (10**9):.2f} Gwei`\n\n"
+            f"*Timestamp:* `{block.get('timestamp', 'N/A')}`\n\n"
+            f"[View on Etherscan](https://etherscan.io/tx/{tx_hash})"
+        )
+
+        await send_to_telegram(message)
+
+    except Exception as e:
+        print(f"Error while processing log: {e}")
+
+async def notify_connection_error(error):
+    """
+    Sends a formatted WebSocket connection error message to Telegram.
+    
+    Args:
+        error (Exception): The exception that triggered the reconnection.
+    """
+    error_code = getattr(error, "code", "N/A")
+
+    error_message = (
+        f"*WebSocket Error Detected!*\n\n"
+        f"Connection to the Ethereum node was unexpectedly closed.\n"
+        f"*Error code:* `{error_code}`\n"
+        f"*Error:* `{str(error)}`\n\n"
+        f"You can check the token activity manually here:\n"
+        f"[View on Etherscan](https://etherscan.io/token/{config.ERC20_CONTRACT_ADDRESS})"
     )
 
-    print(message)
-
-    # Send to Telegram
-    send_to_telegram(message)
+    await send_to_telegram(error_message)
 
 async def subscribe_to_contract_transactions(contract_address, contract_abi):
     """
@@ -129,29 +168,33 @@ async def subscribe_to_contract_transactions(contract_address, contract_abi):
         try:
             contract = web3.eth.contract(address=contract_address, abi=contract_abi)
 
-            async with websockets.connect(config.ALCHEMY_WS_URL) as websocket:
+            async with websockets.connect(
+                config.ALCHEMY_WS_URL,
+                ping_interval=None,
+                ping_timeout=None,
+            ) as websocket:
                 # Subscribe to logs for the specific contract
-                request = {
+                subscribe_payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "eth_subscribe",
                     "params": ["logs", {"address": contract_address}]
                 }
-                await websocket.send(json.dumps(request))
+                await websocket.send(json.dumps(subscribe_payload))
                 print("Subscribed successfully.")
 
                 # Process incoming logs
                 while True:
-                    message = await websocket.recv()
-                    message_json = json.loads(message)
+                    response = await websocket.recv()
+                    message_json = json.loads(response)
 
                     if "params" in message_json:
                         log = message_json["params"]["result"]
-                        log_transaction(log, contract)
+                        await log_transaction(log, contract)
 
         except (websockets.exceptions.ConnectionClosed, Exception) as e:
-            print(f"Error: {e}. Reconnecting...")
-            send_to_telegram("⚡️🚨 *SYSTEM ERROR* - Analysis interrupted. Retrying... 💻💥")
+            await notify_connection_error(e)
+            print("Reconnecting...")
             await asyncio.sleep(5)
 
 # Start the WebSocket subscription process
